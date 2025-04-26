@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+PyJWT
+pydantic[dotenv]
+httpx
+openai
+azure-cosmos
+aiohttp
+cryptography
