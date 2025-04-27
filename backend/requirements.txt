@@ -1,10 +1,12 @@
-fastapi
+fastapi[all]
 uvicorn[standard]
 python-multipart
 PyJWT
 pydantic[dotenv]
 httpx
 openai
-azure-cosmos
+azure-cosmos>=4.6.0
 aiohttp
 cryptography
+PyGithub
+

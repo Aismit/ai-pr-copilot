@@ -5,8 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-COPY ./ai-pr-copilot-dev.2025-04-20.private-key.pem ./ai-pr-copilot-dev.2025-04-20.private-key.pem
+COPY ai-pr-copilot-dev.2025-04-20.private-key.pem .
+COPY ./app ./app
 
 EXPOSE 8000
 
