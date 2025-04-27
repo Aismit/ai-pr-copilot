@@ -14,6 +14,7 @@ from azure.cosmos.aio import CosmosClient
 import httpx
 from github import GithubIntegration
 from fastapi.middleware.cors import CORSMiddleware
+import uuid 
 
 app = FastAPI()
 
@@ -42,11 +43,13 @@ COSMOS_DB_NAME = os.getenv("COSMOS_DB_NAME")
 COSMOS_GRAPH_CONTAINER = os.getenv("COSMOS_GRAPH_CONTAINER")
 GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER")
 GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME")
+COSMOS_COMMENTS_CONTAINER = os.getenv("COSMOS_COMMENTS_CONTAINER")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 cosmos_client = CosmosClient(COSMOS_ENDPOINT, credential=COSMOS_KEY)
 database = cosmos_client.get_database_client(COSMOS_DB_NAME)
 graph_container = database.get_container_client(COSMOS_GRAPH_CONTAINER)
+comments_container = database.get_container_client(COSMOS_COMMENTS_CONTAINER)
 
 def verify(signature: str, body: bytes) -> bool:
     sha_name, sig = signature.split('=')
@@ -116,23 +119,100 @@ async def store_pr_summary(pr_id, summary, embedding):
     item = {"id": f"pr-{pr_id}", "pr_id": pr_id, "summary": summary, "embedding": embedding, "created_at": datetime.datetime.utcnow().isoformat()}
     await graph_container.upsert_item(item)
 
+@app.post("/store-comment")
+async def store_review_comment(comment: str):
+    new_comment = {
+        "id": str(uuid.uuid4()),
+        "comment": comment,
+        "created_at": datetime.datetime.utcnow().isoformat()
+    }
+    await comments_container.create_item(new_comment)
+    return {"status": "stored comment successfully"}
+
+@app.get("/review-comments")
+async def get_review_comments():
+    comments = []
+    async for item in comments_container.query_items(
+        "SELECT c.comment FROM c WHERE IS_DEFINED(c.comment)"):
+        comments.append(item["comment"])
+    return comments
+
+async def analyze_pr_against_comments(diff):
+    comments = []
+    async for item in comments_container.query_items(
+        "SELECT c.comment FROM c WHERE IS_DEFINED(c.comment)"
+    ):
+        comments.append(item["comment"])
+
+    prompt_context = "\n".join(comments)
+    print("Prompt context:\n", prompt_context)
+
+    response = await openai_client.chat.completions.create(
+        model=OPENAI_MODEL_NAME,
+        messages=[
+            {"role": "system", "content": f"You are reviewing code changes against the following rules:\n{prompt_context}\nClearly list any violations along with explanations."},
+            {"role": "user", "content": diff},
+        ]
+    )
+    analysis = response.choices[0].message.content
+    return analysis
+
+
 @app.post("/webhook")
 async def github_webhook(request: Request, x_hub_signature_256: str = Header(None)):
     body = await request.body()
     if not verify(x_hub_signature_256, body):
         raise HTTPException(status_code=401, detail="Bad signature")
+
     payload = json.loads(body)
     action = payload.get("action")
     pr = payload.get("pull_request")
+
     if pr and action in ["opened", "synchronize"]:
         owner = pr["base"]["repo"]["owner"]["login"]
         repo = pr["base"]["repo"]["name"]
         pr_number = pr["number"]
-        diff = await fetch_pr_diff(owner, repo, pr_number)
-        summary = await summarize_diff(diff)
-        embedding = await embed_summary(summary)
-        await store_pr_summary(pr_number, summary, embedding)
+
+        try:
+            diff = await fetch_pr_diff(owner, repo, pr_number)
+
+            summary = await summarize_diff(diff)
+            embedding = await embed_summary(summary)
+            await store_pr_summary(pr_number, summary, embedding)
+            analysis = await analyze_pr_against_comments(diff)
+
+            if "violation" in analysis.lower() or "too long" in analysis.lower():
+                token = await get_installation_access_token(owner, repo)
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json"
+                }
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+                        json={"event": "REQUEST_CHANGES", "body": analysis},
+                        headers=headers
+                    )
+                    print("GitHub response status code:", response.status_code)
+                    print("GitHub response body:", response.text)
+                    response.raise_for_status()
+
+                status = "Rejected PR due to violations"
+            else:
+                status = "No violations detected"
+
+            return {
+                "status": status,
+                "analysis": analysis,
+                "summary": summary
+            }
+
+        except Exception as e:
+            print(f"Error processing PR#{pr_number}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     return {"status": "ok"}
+
 
 @app.post("/pr/{pr_id}/approve")
 async def approve_pr(pr_id: int):
