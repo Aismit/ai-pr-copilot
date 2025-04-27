@@ -237,7 +237,13 @@ async def handle_check_failure(pr_number, failing_sha, check_run):
         diff_res.raise_for_status()
         diff_content = diff_res.text
 
-        analysis = await analyze_check_failure(diff_content, full_logs, check_run["name"])
+        analysis = await analyze_check_failure(
+    diff_content, 
+    full_logs, 
+    check_run["name"], 
+    openai_client, 
+    OPENAI_MODEL_NAME
+)
 
         message = f"""
 🚨 **CI Check Failure**: {check_run["name"]}
