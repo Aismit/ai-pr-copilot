@@ -44,12 +44,14 @@ COSMOS_GRAPH_CONTAINER = os.getenv("COSMOS_GRAPH_CONTAINER")
 GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER")
 GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME")
 COSMOS_COMMENTS_CONTAINER = os.getenv("COSMOS_COMMENTS_CONTAINER")
+COSMOS_CHECK_RESULTS_CONTAINER = os.getenv("COSMOS_CHECK_RESULTS_CONTAINER")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 cosmos_client = CosmosClient(COSMOS_ENDPOINT, credential=COSMOS_KEY)
 database = cosmos_client.get_database_client(COSMOS_DB_NAME)
 graph_container = database.get_container_client(COSMOS_GRAPH_CONTAINER)
 comments_container = database.get_container_client(COSMOS_COMMENTS_CONTAINER)
+check_results_container = database.get_container_client(COSMOS_CHECK_RESULTS_CONTAINER)
 
 def verify(signature: str, body: bytes) -> bool:
     sha_name, sig = signature.split('=')
@@ -157,6 +159,103 @@ async def analyze_pr_against_comments(diff):
     analysis = response.choices[0].message.content
     return analysis
 
+async def analyze_check_failure(diff, check_logs, check_name, openai_client, OPENAI_MODEL_NAME):
+    prompt_content = f"""
+Given the following code diff:
+
+```diff
+{diff}
+```
+
+And the logs from the failing GitHub Action check '{check_name}':
+
+```
+{check_logs}
+```
+
+Analyze both carefully, explain the exact reason for the check failure, and suggest clear and specific changes to fix the problem. Mention line numbers from the provided diff when relevant.
+
+Your explanation should include:
+1. The specific issue identified from the check logs.
+2. A detailed explanation relating the logs to the diff.
+3. Actionable recommendations for how the issue can be resolved directly in the code, including exact line numbers if applicable.
+
+Ensure your response is clear, precise, and immediately actionable for the developer.
+"""
+
+    response = await openai_client.chat.completions.create(
+        model=OPENAI_MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are an expert code reviewer and CI troubleshooting assistant."},
+            {"role": "user", "content": prompt_content}
+        ]
+    )
+
+    return response.choices[0].message.content
+
+async def handle_check_failure(pr_number, failing_sha, check_run):
+    token = await get_installation_access_token(GITHUB_REPO_OWNER, GITHUB_REPO_NAME)
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+
+    async with httpx.AsyncClient() as client:
+        check_run_res = await client.get(
+            f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/check-runs/{check_run['id']}",
+            headers=headers
+        )
+        check_run_res.raise_for_status()
+        check_run_data = check_run_res.json()
+
+        check_output = check_run_data.get('output', {})
+        full_logs = f"{check_output.get('summary', '')}\n\n{check_output.get('text', '')}"
+
+        commits_res = await client.get(
+            f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/pulls/{pr_number}/commits",
+            headers=headers
+        )
+        commits_res.raise_for_status()
+        commits = commits_res.json()
+
+        successful_sha = None
+        for commit in reversed(commits):
+            commit_sha = commit["sha"]
+            query = f"SELECT * FROM c WHERE c.commit_sha = '{commit_sha}' AND c.conclusion = 'success'"
+            items = [item async for item in check_results_container.query_items(query)]
+            if items:
+                successful_sha = commit_sha
+                break
+
+        if successful_sha:
+            diff_url = f"https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/compare/{successful_sha}...{failing_sha}"
+        else:
+            base_branch = (await client.get(
+                f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/pulls/{pr_number}",
+                headers=headers
+            )).json()["base"]["ref"]
+            diff_url = f"https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/compare/{base_branch}...{failing_sha}"
+
+        diff_res = await client.get(diff_url + ".diff", headers=headers)
+        diff_res.raise_for_status()
+        diff_content = diff_res.text
+
+        analysis = await analyze_check_failure(diff_content, full_logs, check_run["name"])
+
+        message = f"""
+🚨 **CI Check Failure**: {check_run["name"]}
+
+A recent commit (`{failing_sha[:7]}`) introduced failures in your CI checks.
+
+### Analysis and Suggested Fixes:
+{analysis}
+
+Please carefully review [this diff]({diff_url}) and the [full check details here]({check_run["html_url"]}) to resolve the issue.
+"""
+
+        review_res = await client.post(
+            f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/pulls/{pr_number}/reviews",
+            json={"event": "REQUEST_CHANGES", "body": message},
+            headers=headers
+        )
+        review_res.raise_for_status()
 
 @app.post("/webhook")
 async def github_webhook(request: Request, x_hub_signature_256: str = Header(None)):
@@ -165,6 +264,31 @@ async def github_webhook(request: Request, x_hub_signature_256: str = Header(Non
         raise HTTPException(status_code=401, detail="Bad signature")
 
     payload = json.loads(body)
+    event_type = request.headers.get("X-GitHub-Event")
+
+    if event_type == "check_run":
+        check_run = payload.get("check_run", {})
+        conclusion = check_run.get("conclusion")
+        commit_sha = check_run.get("head_sha")
+        pr_numbers = [pr["number"] for pr in check_run.get("pull_requests", [])]
+
+        for pr_number in pr_numbers:
+            item = {
+                "id": str(uuid.uuid4()),
+                "check_run_id": check_run["id"],
+                "check_name": check_run["name"],
+                "status": check_run["status"],
+                "conclusion": conclusion,
+                "commit_sha": commit_sha,
+                "pr_number": pr_number,
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "details_url": check_run["html_url"]
+            }
+            await check_results_container.upsert_item(item)
+
+            if conclusion == "failure":
+                await handle_check_failure(pr_number, commit_sha, check_run)
+
     action = payload.get("action")
     pr = payload.get("pull_request")
 
@@ -193,8 +317,6 @@ async def github_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         json={"event": "REQUEST_CHANGES", "body": analysis},
                         headers=headers
                     )
-                    print("GitHub response status code:", response.status_code)
-                    print("GitHub response body:", response.text)
                     response.raise_for_status()
 
                 status = "Rejected PR due to violations"
