@@ -7,7 +7,7 @@ import hashlib
 import json
 import datetime
 import time
-import jwt  # PyJWT
+import jwt
 from fastapi import FastAPI, Header, HTTPException, Request
 from openai import AsyncOpenAI
 from azure.cosmos.aio import CosmosClient
@@ -18,8 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 origins = [
-    "http://localhost:5173", # your React frontend dev URL
-    "https://62ef-76-132-154-233.ngrok-free.app",  # ngrok URL
+    "http://localhost:5173",
+    "https://62ef-76-132-154-233.ngrok-free.app",
 ]
 
 app.add_middleware(
@@ -30,7 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Environment variables
 WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET").encode()
 GITHUB_APP_ID = os.getenv("GITHUB_APP_ID")
 GITHUB_PRIVATE_KEY_PATH = os.getenv("GITHUB_PRIVATE_KEY_PATH")
@@ -44,13 +43,11 @@ COSMOS_GRAPH_CONTAINER = os.getenv("COSMOS_GRAPH_CONTAINER")
 GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER")
 GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME")
 
-# Clients
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 cosmos_client = CosmosClient(COSMOS_ENDPOINT, credential=COSMOS_KEY)
 database = cosmos_client.get_database_client(COSMOS_DB_NAME)
 graph_container = database.get_container_client(COSMOS_GRAPH_CONTAINER)
 
-# Verify webhook signature
 def verify(signature: str, body: bytes) -> bool:
     sha_name, sig = signature.split('=')
     mac = hmac.new(WEBHOOK_SECRET, msg=body, digestmod=hashlib.sha256)
@@ -73,7 +70,6 @@ async def get_pr_summaries():
     finally:
         await client.close()
 
-# GitHub JWT and installation token
 def generate_jwt():
     with open(GITHUB_PRIVATE_KEY_PATH, "rb") as pem_file:
         private_key = pem_file.read()
